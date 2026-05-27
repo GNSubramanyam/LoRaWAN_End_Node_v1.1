@@ -1,0 +1,10 @@
+../Drivers/STM32WLxx_HAL_Driver/Inc/stm32wlxx_ll_pwr.h:2196:22:LL_PWR_ClearFlag_C1STOP_C1STB	1
+../Drivers/STM32WLxx_HAL_Driver/Inc/stm32wlxx_ll_bus.h:914:22:LL_APB1_GRP1_EnableClock	1
+../Drivers/STM32WLxx_HAL_Driver/Inc/stm32wlxx_ll_bus.h:1018:22:LL_APB1_GRP1_DisableClock	1
+../Drivers/STM32WLxx_HAL_Driver/Inc/stm32wlxx_ll_bus.h:1351:22:LL_APB2_GRP1_DisableClock	1
+../Core/Src/stm32_lpm_if.c:80:6:PWR_EnterOffMode	1
+../Core/Src/stm32_lpm_if.c:87:6:PWR_ExitOffMode	1
+../Core/Src/stm32_lpm_if.c:94:6:PWR_EnterStopMode	1
+../Core/Src/stm32_lpm_if.c:122:6:PWR_ExitStopMode	1
+../Core/Src/stm32_lpm_if.c:143:6:PWR_EnterSleepMode	1
+../Core/Src/stm32_lpm_if.c:159:6:PWR_ExitSleepMode	1

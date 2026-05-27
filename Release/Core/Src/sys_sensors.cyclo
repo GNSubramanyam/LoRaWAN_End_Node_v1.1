@@ -1,0 +1,4 @@
+../Core/Src/sys_sensors.c:133:9:EnvSensors_Read	1
+../Core/Src/sys_sensors.c:172:9:EnvSensors_Init	1
+../Core/Src/sys_sensors.c:295:5:BMM350_Init	2
+../Core/Src/sys_sensors.c:345:5:BMM350_Read	2

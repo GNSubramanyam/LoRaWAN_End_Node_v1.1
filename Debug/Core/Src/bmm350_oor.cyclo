@@ -1,0 +1,5 @@
+../Core/Src/bmm350_oor.c:46:15:trigger_half_selftest	7
+../Core/Src/bmm350_oor.c:95:13:validate_half_selftest	7
+../Core/Src/bmm350_oor.c:203:13:validate_out_of_range	14
+../Core/Src/bmm350_oor.c:259:8:bmm350_oor_perform_reset_sequence_forced	5
+../Core/Src/bmm350_oor.c:293:8:bmm350_oor_read	3

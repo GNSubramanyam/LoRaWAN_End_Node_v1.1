@@ -1,0 +1,4 @@
+../Core/Src/common.c:10:22:bmm350_i2c_read	40	static
+../Core/Src/common.c:28:22:bmm350_i2c_write	24	dynamic
+../Core/Src/common.c:49:6:bmm350_delay	0	static
+../Core/Src/common.c:58:8:bmm350_interface_init	0	static

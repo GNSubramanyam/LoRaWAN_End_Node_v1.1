@@ -1,0 +1,2 @@
+../Core/Src/bmm350_oor.c:259:8:bmm350_oor_perform_reset_sequence_forced	16	static
+../Core/Src/bmm350_oor.c:293:8:bmm350_oor_read	48	static

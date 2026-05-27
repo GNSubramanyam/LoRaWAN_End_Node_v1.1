@@ -1,0 +1,10 @@
+../Drivers/STM32WLxx_HAL_Driver/Inc/stm32wlxx_ll_bus.h:1374:22:LL_APB2_GRP1_ForceReset	1
+../Drivers/STM32WLxx_HAL_Driver/Inc/stm32wlxx_ll_bus.h:1397:22:LL_APB2_GRP1_ReleaseReset	1
+../Core/Src/usart_if.c:101:25:vcom_Init	1
+../Core/Src/usart_if.c:119:25:vcom_DeInit	1
+../Core/Src/usart_if.c:142:6:vcom_Trace	1
+../Core/Src/usart_if.c:153:25:vcom_Trace_DMA	1
+../Core/Src/usart_if.c:165:25:vcom_ReceiveInit	3
+../Core/Src/usart_if.c:201:6:vcom_Resume	3
+../Core/Src/usart_if.c:222:6:HAL_UART_TxCpltCallback	2
+../Core/Src/usart_if.c:237:6:HAL_UART_RxCpltCallback	4
