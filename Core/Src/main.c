@@ -214,8 +214,15 @@ static void SetHSECalibrationOut(uint8_t val)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
-  __disable_irq();
+  /* On unrecoverable HAL failure: log and force a clean reset. Previously this
+   * disabled all IRQs and spun in while(1) until the 32s IWDG fired, leaving a
+   * gap visible from ChirpStack as a missing device. NVIC_SystemReset recovers
+   * in milliseconds. */
+#if (APP_LOG_ENABLED == 1)
+  APP_LOG(TS_ON, VLEVEL_L, "Error_Handler invoked — resetting\r\n");
+#endif
+  NVIC_SystemReset();
+  /* Unreachable, but keep a fallback. */
   while (1)
   {
   }

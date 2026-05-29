@@ -73,9 +73,11 @@ extern "C" {
 
 /**
   * @brief Enable/Disable MCU Debugger pins (dbg serial wires)
-  * @note  by HW serial wires are ON by default, need to put them OFF to save power
+  * @note  by HW serial wires are ON by default, need to put them OFF to save power.
+  *        Set to 1 only for bench debugging; 0 for production (saves ~10s of µA in
+  *        STOP2 and removes the SWD attack surface).
   */
-#define DEBUGGER_ENABLED                     1
+#define DEBUGGER_ENABLED                     0
 
 /**
   * @brief Disable Low Power mode

@@ -14,4 +14,8 @@ BMM350_INTF_RET_TYPE bmm350_i2c_write(uint8_t reg_addr, uint8_t *reg_data, uint3
 void bmm350_delay(uint32_t period, void *intf_ptr);
 int8_t bmm350_interface_init(struct bmm350_dev *dev);
 
+/* Application-level diagnostics / recovery for the BMM350 I2C bus. */
+extern volatile uint32_t bmm350_i2c_fail_count;
+HAL_StatusTypeDef bmm350_i2c_bus_recover(void);
+
 #endif

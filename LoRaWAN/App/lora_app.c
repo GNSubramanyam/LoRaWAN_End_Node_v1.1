@@ -40,6 +40,8 @@
 #include "adc.h"             /* For ADC_ReadVoltage, adc_voltage */
 #include "utilities.h"		/* For randr for jitter */
 #include "iwdg.h"
+#include "common.h"          /* bmm350_i2c_bus_recover, bmm350_i2c_fail_count */
+#include "lora_keys.h"       /* LoRa_InstallPerDeviceKeys */
 /* USER CODE END Includes */
 
 /* External variables ---------------------------------------------------------*/
@@ -112,10 +114,13 @@ typedef enum TxEventType_e
 #define TEMPERATURE_HIGH_THRESHOLD	60.0f   /* degC — send alert when temperature exceeds this */
 #define TEMPERATURE_HIGH_STATUS		(uint8_t)(0x0A)
 #define RETRANSMIT_DELAY_MS			15000
-#define JITTER_MS					20000		/* jitter in milliseconds */
+#define STATE_CHANGE_TX_REPEATS		2			/* extra copies after the first → 3 total sends per state change (unconfirmed redundancy) */
+#define STATE_CHANGE_REPEAT_GAP_MS	4000		/* spacing between redundant state-change copies */
+#define JITTER_MS					60000		/* jitter in milliseconds — wider window de-clusters the fleet */
 #define JITTER_RETRANSMISSION		2000		/* jitter for retransmission */
 #define THREE_HOUR_TIME				3 * 60 * 60000
 #define MAX_JOIN_ATTEMPTS			30
+#define NVM_STORE_FCNT_INTERVAL		20		/* persist LoRaWAN context to flash at most once per N uplinks (flash-wear protection) */
 
 typedef enum {
   DETECT_IDLE = 0,
@@ -250,10 +255,12 @@ static void OnTemperatureCheckTimerEvent(void *context);
 static void OnRetransmitTimerEvent(void *context);
 static void JoinTimerEvent(void *context);
 static void ConfirmDetection(void);
+static void SendStateChange(uint8_t statusByte);
 static void SendHeartBeat(void);
 static void CheckBatteryVoltage(void);
 static void CheckTemperature(void);
 static float ComputeMagnitude(BMM350_data_t *reading);
+static UTIL_TIMER_Time_t JitterPeriod(UTIL_TIMER_Time_t base, uint32_t jitter);
 static void DoRetransmit(void);
 static void join_task(void);
 static void WDG_Timer_task(void);
@@ -358,9 +365,6 @@ bool parked = false;
 static DetectState_t detect_state = DETECT_IDLE;
 static int confirm_count = 0;
 
-/* Transmit-in-progress guard to prevent AppData buffer contention */
-static volatile bool tx_in_progress = false;
-
 /* Battery monitoring — send alert once when voltage drops to threshold */
 static volatile bool battery_low_sent = false;
 
@@ -369,6 +373,11 @@ static volatile bool temperature_high_sent = false;
 
 static volatile bool retransmit_pending = false;
 static uint8_t retransmit_status = 0;
+static volatile uint8_t retransmit_count = 0;   /* redundant state-change copies still to send */
+
+/* Uplink counter value at the last NVM context store — used to throttle flash
+ * writes to once per NVM_STORE_FCNT_INTERVAL uplinks (see OnTxData). */
+static uint32_t last_stored_fcnt = 0;
 /* USER CODE END PV */
 
 /* Exported functions ---------------------------------------------------------*/
@@ -412,6 +421,10 @@ void LoRaWAN_Init(void)
 
   LmHandlerConfigure(&LmHandlerParams);
 
+  /* Override the hardcoded test keys from se-identity.h with per-device keys
+   * derived from the MCU UID + PROJECT_SECRET. Must run before LmHandlerJoin(). */
+  LoRa_InstallPerDeviceKeys();
+
   /* USER CODE BEGIN LoRaWAN_Init_2 */
   uint8_t standby_cfg = 0x00; /* STDBY_RC */
   uint8_t hse_in = 0x06;
@@ -424,8 +437,12 @@ void LoRaWAN_Init(void)
   HAL_SUBGHZ_ExecSetCmd(&hsubghz, RADIO_SET_STANDBY, &standby_cfg, 1);
   /* USER CODE END LoRaWAN_Init_2 */
 
-  LmHandlerJoin(ActivationType, ForceRejoin);
-  join_attempts++;
+  /* Per-device boot delay (0..60s) derived from the low 16 bits of MCU UID.
+   * Deterministic, spreads 150 nodes across a 60s window so a bulk power-on
+   * doesn't produce a synchronised join storm on the gateway. */
+  uint32_t boot_join_delay_ms = (HAL_GetUIDw0() & 0xFFFFu) * 60000u / 65536u;
+  /* Always at least 100ms so the timer actually arms. */
+  if (boot_join_delay_ms < 100u) boot_join_delay_ms = 100u;
 
   if (EventType == TX_ON_TIMER)
   {
@@ -436,26 +453,16 @@ void LoRaWAN_Init(void)
     UTIL_TIMER_Create(&BatteryCheckTimer, CHECK_TIME, UTIL_TIMER_ONESHOT, OnBatteryCheckTimerEvent, NULL);
     UTIL_TIMER_Create(&TemperatureCheckTimer, CHECK_TIME, UTIL_TIMER_ONESHOT, OnTemperatureCheckTimerEvent, NULL);
     UTIL_TIMER_Create(&RetransmitTimer, RETRANSMIT_DELAY_MS, UTIL_TIMER_ONESHOT, OnRetransmitTimerEvent, NULL);
-    UTIL_TIMER_Create(&JoinTimer, RETRANSMIT_DELAY_MS, UTIL_TIMER_ONESHOT, JoinTimerEvent, NULL);
+    UTIL_TIMER_Create(&JoinTimer, boot_join_delay_ms, UTIL_TIMER_ONESHOT, JoinTimerEvent, NULL);
     UTIL_TIMER_Create(&WDGTimer, WDGPeriodicity, UTIL_TIMER_PERIODIC, OnWDGTimerEvent, NULL);
     UTIL_TIMER_Start(&WDGTimer);
     /* ConfirmTimer NOT started here — only started on-demand when threshold is crossed */
-    //UTIL_TIMER_Start(&TxTimer);
-    //UTIL_TIMER_Start(&BatteryCheckTimer);
-    //UTIL_TIMER_Start(&TemperatureCheckTimer);
 
-    if( LmHandlerJoinStatus( ) != LORAMAC_HANDLER_SET )
-    {
-        /* The network isn't yet joined, try again later. */
-    	UTIL_TIMER_Start(&JoinTimer);
-    }
-    else
-    {
-	    UTIL_TIMER_Start(&TxTimer);
-	    UTIL_TIMER_Start(&BatteryCheckTimer);
-	    UTIL_TIMER_Start(&TemperatureCheckTimer);
-    }
-
+    /* First join is scheduled via JoinTimer after boot_join_delay_ms, not
+     * called inline. join_task() does the actual LmHandlerJoin() and handles
+     * retries from there. */
+    APP_LOG(TS_ON, VLEVEL_L, "First-join scheduled in %lums\r\n", (unsigned long)boot_join_delay_ms);
+    UTIL_TIMER_Start(&JoinTimer);
   }
   else
   {
@@ -507,6 +514,53 @@ static float ComputeMagnitude(BMM350_data_t *reading)
   return sqrtf((dx * dx) + (dy * dy) + (dz * dz));
 }
 
+/* Apply symmetric jitter to a timer period for fleet de-clustering, while
+ * guaranteeing the result can never collapse to ~0. The jitter swing is capped
+ * at ±50% of the base, so the period always stays within [base/2, 3*base/2].
+ * (Previously a ±100% swing on the 60s poll could yield a 0ms period.) */
+static UTIL_TIMER_Time_t JitterPeriod(UTIL_TIMER_Time_t base, uint32_t jitter)
+{
+  if (jitter > base / 2u)
+  {
+    jitter = base / 2u;
+  }
+  return base + (UTIL_TIMER_Time_t)randr(-(int32_t)jitter, (int32_t)jitter);
+}
+
+/* Threshold of consecutive BMM350 I2C failures before we attempt bus recovery. */
+#define BMM350_FAIL_THRESHOLD   3
+
+/* Wrapper around BMM350_Read() that escalates to I2C bus recovery and ultimately
+ * a system reset if the sensor has gone unreachable. Returns 0 on success, <0 on failure. */
+static int BMM350_Read_Safe(BMM350_data_t *reading)
+{
+  if (BMM350_Read(reading) == 0 && bmm350_i2c_fail_count == 0)
+  {
+    return 0;
+  }
+
+  /* Read failed (BMM350_Read returned <0) or some inner I2C op silently failed. */
+  APP_LOG(TS_ON, VLEVEL_L, "BMM350 read fail (count=%lu)\r\n", (unsigned long)bmm350_i2c_fail_count);
+
+  if (bmm350_i2c_fail_count >= BMM350_FAIL_THRESHOLD)
+  {
+    APP_LOG(TS_ON, VLEVEL_L, "BMM350: triggering I2C bus recovery\r\n");
+    if (bmm350_i2c_bus_recover() != HAL_OK)
+    {
+      APP_LOG(TS_ON, VLEVEL_L, "BMM350: bus recovery failed, resetting\r\n");
+      NVIC_SystemReset();
+    }
+    /* After recovery, one re-init attempt. */
+    BMM350_Init();
+    /* Try the read once more — if it works, the caller gets fresh data. */
+    if (BMM350_Read(reading) == 0 && bmm350_i2c_fail_count == 0)
+    {
+      return 0;
+    }
+  }
+  return -1;
+}
+
 /**
   * @brief  Confirmation read handler — called by timer after threshold was crossed.
   *         MCU was in STOP2 since the previous read. Reads BMM350, checks threshold,
@@ -514,11 +568,15 @@ static float ComputeMagnitude(BMM350_data_t *reading)
   */
 static void ConfirmDetection(void)
 {
-  LmHandlerErrorStatus_t status = LORAMAC_HANDLER_ERROR;
-  UTIL_TIMER_Time_t nextTxIn = 0;
-
   BMM350_data_t reading;
-  BMM350_Read(&reading);
+  if (BMM350_Read_Safe(&reading) != 0)
+  {
+    /* Sensor unreachable — do NOT update the state machine on garbage data.
+     * Abort the confirmation cycle; the next polling tick will retry. */
+    APP_LOG(TS_ON, VLEVEL_L, "ConfirmDetection: sensor read failed, aborting cycle\r\n");
+    detect_state = DETECT_IDLE;
+    return;
+  }
   float mag = ComputeMagnitude(&reading);
 
   if (detect_state == DETECT_CONFIRMING_OCC)
@@ -534,36 +592,11 @@ static void ConfirmDetection(void)
         APP_LOG(TS_ON, VLEVEL_L, "VEHICLE DETECTED (%d/%d confirmed)\r\n",
                 OCC_CONFIRM_READS + 1, OCC_CONFIRM_READS + 1);
 
-        if (LmHandlerIsBusy() == false)
-        {
-          uint32_t k = 0;
-          AppData.Port = LORAWAN_USER_APP_PORT;
-          AppData.Buffer[k++] = SLOT_OCCUPIED;
-          AppData.BufferSize = k;
-          status = LmHandlerSend(&AppData, LmHandlerParams.IsTxConfirmed, false);
-          if (LORAMAC_HANDLER_SUCCESS == status)
-          {
-            retransmit_status = SLOT_OCCUPIED;
-            retransmit_pending = true;
-            UTIL_TIMER_Stop(&RetransmitTimer);
-            UTIL_TIMER_Start(&RetransmitTimer);
-          }
-          else if (LORAMAC_HANDLER_DUTYCYCLE_RESTRICTED == status)
-          {
-            nextTxIn = LmHandlerGetDutyCycleWaitTime();
-            if (nextTxIn > 0)
-            {
-              APP_LOG(TS_ON, VLEVEL_L, "Next Tx in  : ~%d second(s)\r\n", (nextTxIn / 1000));
-            }
-          }
-          else
-          {
-              retransmit_status = SLOT_OCCUPIED;
-              retransmit_pending = true;
-        	  UTIL_TIMER_Stop(&RetransmitTimer);
-        	  UTIL_TIMER_Start(&RetransmitTimer);
-          }
-        }
+        /* Queue redundant unconfirmed copies (1 + STATE_CHANGE_TX_REPEATS = 3 total)
+         * so the event survives RF collisions / weak signal on the best-effort link.
+         * Every copy is emitted through DoRetransmit(), which handles MAC-busy and
+         * duty-cycle internally. */
+        SendStateChange(SLOT_OCCUPIED);
       }
       else
       {
@@ -591,36 +624,8 @@ static void ConfirmDetection(void)
         APP_LOG(TS_ON, VLEVEL_L, "VEHICLE LEFT (%d/%d confirmed)\r\n",
                 UNOCC_CONFIRM_READS + 1, UNOCC_CONFIRM_READS + 1);
 
-        if (LmHandlerIsBusy() == false)
-        {
-          uint32_t k = 0;
-          AppData.Port = LORAWAN_USER_APP_PORT;
-          AppData.Buffer[k++] = SLOT_EMPTY;
-          AppData.BufferSize = k;
-          status = LmHandlerSend(&AppData, LmHandlerParams.IsTxConfirmed, false);
-          if (LORAMAC_HANDLER_SUCCESS == status)
-          {
-              retransmit_status = SLOT_EMPTY;
-              retransmit_pending = true;
-        	  UTIL_TIMER_Stop(&RetransmitTimer);
-        	  UTIL_TIMER_Start(&RetransmitTimer);
-          }
-          else if (LORAMAC_HANDLER_DUTYCYCLE_RESTRICTED == status)
-          {
-            nextTxIn = LmHandlerGetDutyCycleWaitTime();
-            if (nextTxIn > 0)
-            {
-              APP_LOG(TS_ON, VLEVEL_L, "Next Tx in  : ~%d second(s)\r\n", (nextTxIn / 1000));
-            }
-          }
-          else
-          {
-              retransmit_status = SLOT_EMPTY;
-              retransmit_pending = true;
-        	  UTIL_TIMER_Stop(&RetransmitTimer);
-        	  UTIL_TIMER_Start(&RetransmitTimer);
-          }
-        }
+        /* Queue redundant unconfirmed copies (3 total) — see SendStateChange(). */
+        SendStateChange(SLOT_EMPTY);
 
         /* Slow baseline drift (EMA) */
         BMM350_CALIBRATED_BASE.x = (BMM350_CALIBRATED_BASE.x * 0.99f) + (reading.x * 0.01f);
@@ -746,7 +751,14 @@ static void CheckTemperature(void)
   UTIL_TIMER_Time_t nextTxIn = 0;
 
   BMM350_data_t reading;
-  BMM350_Read(&reading);
+  if (BMM350_Read_Safe(&reading) != 0)
+  {
+    /* Sensor unreachable — `reading` is uninitialised stack data here, so do NOT
+     * evaluate it (a garbage value could trip a false high-temperature alert).
+     * Skip this cycle; the next TemperatureCheckTimer tick retries. */
+    APP_LOG(TS_ON, VLEVEL_L, "CheckTemperature: sensor read failed, skipping\r\n");
+    return;
+  }
   float temperature = reading.temperature;
   APP_LOG(TS_ON, VLEVEL_L, "BMM350 Temperature: %d.%02d degC\r\n",
           (int)temperature,
@@ -792,34 +804,81 @@ static void CheckTemperature(void)
   }
 }
 
+/* Begin a redundant state-change transmission: the given status byte is sent
+ * 1 + STATE_CHANGE_TX_REPEATS times (3 total) on the best-effort unconfirmed link.
+ * The first copy is fired immediately via the sequencer; DoRetransmit() emits each
+ * copy and schedules the next one STATE_CHANGE_REPEAT_GAP_MS apart. A newer state
+ * change simply overwrites the status and resets the counter (latest state wins). */
+static void SendStateChange(uint8_t statusByte)
+{
+  retransmit_status  = statusByte;
+  retransmit_count   = STATE_CHANGE_TX_REPEATS;
+  retransmit_pending = true;
+
+  UTIL_TIMER_Stop(&RetransmitTimer);
+  UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_RetransmitEvent), CFG_SEQ_Prio_0);
+}
+
 static void DoRetransmit(void)
 {
   if (!retransmit_pending)
   {
-    return;  /* Already cancelled or duplicate — nothing to do */
+    return;  /* Already cancelled or all copies sent — nothing to do */
   }
-  retransmit_pending = false;
 
-  if (LmHandlerIsBusy() == false)
+  /* If MAC is still busy, reschedule. Do NOT clear retransmit_pending or the
+   * copy counter here — that would drop the packet on the floor. */
+  if (LmHandlerIsBusy() == true)
   {
-    uint32_t k = 0;
-    AppData.Port = LORAWAN_USER_APP_PORT;
-    AppData.Buffer[k++] = retransmit_status;
-    AppData.BufferSize = k;
+    APP_LOG(TS_ON, VLEVEL_L, "RETRANSMIT deferred — MAC busy, retry shortly\r\n");
+    UTIL_TIMER_Stop(&RetransmitTimer);
+    UTIL_TIMER_SetPeriod(&RetransmitTimer,
+        STATE_CHANGE_REPEAT_GAP_MS + randr(-JITTER_RETRANSMISSION, JITTER_RETRANSMISSION));
+    UTIL_TIMER_Start(&RetransmitTimer);
+    return;
+  }
 
-    LmHandlerErrorStatus_t status = LmHandlerSend(&AppData, LmHandlerParams.IsTxConfirmed, false);
-    if (LORAMAC_HANDLER_SUCCESS == status)
+  AppData.Port = LORAWAN_USER_APP_PORT;
+  AppData.Buffer[0] = retransmit_status;
+  AppData.BufferSize = 1;
+
+  LmHandlerErrorStatus_t status = LmHandlerSend(&AppData, LmHandlerParams.IsTxConfirmed, false);
+  if (LORAMAC_HANDLER_SUCCESS == status)
+  {
+    /* One copy went out. Schedule the next redundant copy, or finish. */
+    if (retransmit_count > 0)
     {
-      APP_LOG(TS_ON, VLEVEL_L, "RETRANSMIT 0x%02X sent\r\n", retransmit_status);
+      retransmit_count--;
+      APP_LOG(TS_ON, VLEVEL_L, "STATE 0x%02X sent, %d copy(ies) left\r\n", retransmit_status, retransmit_count);
+      UTIL_TIMER_Stop(&RetransmitTimer);
+      UTIL_TIMER_SetPeriod(&RetransmitTimer,
+          STATE_CHANGE_REPEAT_GAP_MS + randr(-JITTER_RETRANSMISSION, JITTER_RETRANSMISSION));
+      UTIL_TIMER_Start(&RetransmitTimer);
     }
     else
     {
-      APP_LOG(TS_ON, VLEVEL_L, "RETRANSMIT failed (status %d)\r\n", status);
+      retransmit_pending = false;
+      APP_LOG(TS_ON, VLEVEL_L, "STATE 0x%02X sent, final copy\r\n", retransmit_status);
     }
+  }
+  else if (LORAMAC_HANDLER_DUTYCYCLE_RESTRICTED == status)
+  {
+    /* Send did not happen — reschedule after the duty-cycle window, keep the counter. */
+    UTIL_TIMER_Time_t nextTxIn = LmHandlerGetDutyCycleWaitTime();
+    UTIL_TIMER_Stop(&RetransmitTimer);
+    UTIL_TIMER_SetPeriod(&RetransmitTimer,
+        MAX(nextTxIn + randr(0, JITTER_RETRANSMISSION), (UTIL_TIMER_Time_t)STATE_CHANGE_REPEAT_GAP_MS));
+    UTIL_TIMER_Start(&RetransmitTimer);
+    APP_LOG(TS_ON, VLEVEL_L, "RETRANSMIT duty-cycle restricted, retry in ~%ds\r\n", (int)(nextTxIn / 1000));
   }
   else
   {
-    APP_LOG(TS_ON, VLEVEL_L, "RETRANSMIT skipped — MAC busy\r\n");
+    /* Other error — send did not happen, retry shortly, keep the counter. */
+    UTIL_TIMER_Stop(&RetransmitTimer);
+    UTIL_TIMER_SetPeriod(&RetransmitTimer,
+        STATE_CHANGE_REPEAT_GAP_MS + randr(-JITTER_RETRANSMISSION, JITTER_RETRANSMISSION));
+    UTIL_TIMER_Start(&RetransmitTimer);
+    APP_LOG(TS_ON, VLEVEL_L, "RETRANSMIT failed (status %d), rescheduled\r\n", status);
   }
 }
 
@@ -841,14 +900,14 @@ static void join_task(void)
 
     if (join_attempts < MAX_JOIN_ATTEMPTS)
     {
-        // FAST retry
-        UTIL_TIMER_SetPeriod(&JoinTimer, RETRANSMIT_DELAY_MS);
+        // FAST retry — jitter ±7s so 150 nodes don't re-join in lockstep on a bulk power-on.
+        UTIL_TIMER_SetPeriod(&JoinTimer, RETRANSMIT_DELAY_MS + randr(-7000, 7000));
     }
     else
     {
-        // LONG delay
+        // LONG delay — jitter ±5 min so the fleet doesn't return as a herd after the 3h backoff.
         join_attempts = 0;
-        UTIL_TIMER_SetPeriod(&JoinTimer, THREE_HOUR_TIME);
+        UTIL_TIMER_SetPeriod(&JoinTimer, THREE_HOUR_TIME + randr(-300000, 300000));
     }
 	UTIL_TIMER_Start(&JoinTimer);
 }
@@ -873,8 +932,11 @@ static void OnRxData(LmHandlerAppData_t *appData, LmHandlerRxParams_t *params)
 	        {
 	          switch (appData->Port)
 	          {
+#if defined(ENABLE_CLASS_SWITCH_PORT) && (ENABLE_CLASS_SWITCH_PORT == 1)
 	            case LORAWAN_SWITCH_CLASS_PORT:
-	              /*this port switches the class*/
+	              /* Disabled in production: a stray downlink on port 3 could move
+	               * the node to Class B/C and burn battery on continuous RX. Set
+	               * ENABLE_CLASS_SWITCH_PORT=1 only for bench testing. */
 	              if (appData->BufferSize == 1)
 	              {
 	                switch (appData->Buffer[0])
@@ -899,6 +961,7 @@ static void OnRxData(LmHandlerAppData_t *appData, LmHandlerRxParams_t *params)
 	                }
 	              }
 	              break;
+#endif
 	            case LORAWAN_USER_APP_PORT:
 	              if (appData->BufferSize == 1)
 	              {
@@ -943,7 +1006,12 @@ static void SendTxData(void)
 
     /* --- Read BMM350 once --- */
     BMM350_data_t reading;
-    BMM350_Read(&reading);
+    if (BMM350_Read_Safe(&reading) != 0)
+    {
+      /* Sensor unreachable. Skip this cycle and let the next TxTimer try again
+       * (with possible bus recovery already attempted inside BMM350_Read_Safe). */
+      return;
+    }
 
     if (!is_Calibration_done)
     {
@@ -1035,7 +1103,7 @@ static void OnTxTimerEvent(void *context)
 
   /* USER CODE BEGIN OnTxTimerEvent_2 */
   UTIL_TIMER_Stop(&TxTimer);
-  UTIL_TIMER_SetPeriod(&TxTimer, TxPeriodicity + randr(-JITTER_MS, JITTER_MS));
+  UTIL_TIMER_SetPeriod(&TxTimer, JitterPeriod(TxPeriodicity, JITTER_MS));
   UTIL_TIMER_Start(&TxTimer);
   /* USER CODE END OnTxTimerEvent_2 */
 }
@@ -1057,7 +1125,7 @@ static void OnHeartBeatTimerEvent(void *context)
   /* USER CODE BEGIN OnReadBMM350TimerEvent */
 	/*Wait for next tx slot*/
 	UTIL_TIMER_Stop(&SendHeartBeatTimer);
-	UTIL_TIMER_SetPeriod(&SendHeartBeatTimer, HBPeriodicity + randr(-JITTER_MS, JITTER_MS));
+	UTIL_TIMER_SetPeriod(&SendHeartBeatTimer, JitterPeriod(HBPeriodicity, JITTER_MS));
 	UTIL_TIMER_Start(&SendHeartBeatTimer);
   /* USER CODE END OnReadBMM350TimerEvent */
 }
@@ -1067,7 +1135,7 @@ static void OnBatteryCheckTimerEvent(void *context)
   UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_BatteryCheckEvent), CFG_SEQ_Prio_0);
   /* Restart timer for next check */
   UTIL_TIMER_Stop(&BatteryCheckTimer);
-  UTIL_TIMER_SetPeriod(&BatteryCheckTimer, CHECK_TIME + randr(-JITTER_MS, JITTER_MS));
+  UTIL_TIMER_SetPeriod(&BatteryCheckTimer, JitterPeriod(CHECK_TIME, JITTER_MS));
   UTIL_TIMER_Start(&BatteryCheckTimer);
 }
 
@@ -1076,16 +1144,15 @@ static void OnTemperatureCheckTimerEvent(void *context)
   UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_TemperatureCheckEvent), CFG_SEQ_Prio_0);
   /* Restart timer for next check */
   UTIL_TIMER_Stop(&TemperatureCheckTimer);
-  UTIL_TIMER_SetPeriod(&TemperatureCheckTimer, CHECK_TIME + randr(-JITTER_MS, JITTER_MS));
+  UTIL_TIMER_SetPeriod(&TemperatureCheckTimer, JitterPeriod(CHECK_TIME, JITTER_MS));
   UTIL_TIMER_Start(&TemperatureCheckTimer);
 }
 
 static void OnRetransmitTimerEvent(void *context)
 {
-  /* Oneshot — fire the retransmit task exactly once */
+  /* Oneshot — fire the retransmit task; DoRetransmit() decides whether to
+   * reschedule for the next redundant copy and with what period. */
   UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_RetransmitEvent), CFG_SEQ_Prio_0);
-  UTIL_TIMER_Stop(&RetransmitTimer);
-  UTIL_TIMER_SetPeriod(&RetransmitTimer, RETRANSMIT_DELAY_MS + randr(-JITTER_RETRANSMISSION, JITTER_RETRANSMISSION));
 }
 
 static void JoinTimerEvent(void *context)
@@ -1123,8 +1190,27 @@ static void OnTxData(LmHandlerTxParams_t *params)
 	  {
 		APP_LOG(TS_OFF, VLEVEL_H, "UNCONFIRMED\r\n");
 	  }
+
+	  /* Throttle NVM persistence on the high-frequency data path. The uplink
+	   * frame counter changes on every TX, so storing context on every frame
+	   * erases+rewrites a flash page per uplink and wears the page out within
+	   * the deployment lifetime. Persist only once every NVM_STORE_FCNT_INTERVAL
+	   * uplinks; the worst case on an unexpected reset is losing that many frames
+	   * of counter advance (recoverable). Unsigned subtraction is wrap-safe, and
+	   * a session reset after join self-corrects with one immediate store. */
+	  if ((params->UplinkCounter - last_stored_fcnt) >= NVM_STORE_FCNT_INTERVAL)
+	  {
+		last_stored_fcnt = params->UplinkCounter;
+		UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_LoRaStoreContextEvent), CFG_SEQ_Prio_0);
+	  }
 	}
-	UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_LoRaStoreContextEvent), CFG_SEQ_Prio_0);
+	else
+	{
+	  /* Non-MCPS (e.g. MLME join-request) confirm: persist immediately so
+	   * DevNonce / session state survive a reset even during a join-failure
+	   * storm. These are infrequent and are not the source of flash wear. */
+	  UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_LoRaStoreContextEvent), CFG_SEQ_Prio_0);
+	}
   }
   /* USER CODE END OnTxData_1 */
 }

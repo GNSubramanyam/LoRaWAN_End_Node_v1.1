@@ -28,6 +28,7 @@
 #include "i2c.h"
 #include "spi.h"
 #include "sys_conf.h"
+#include "common.h"   /* bmm350_i2c_bus_recover() */
 /* USER CODE END Includes */
 
 /* External variables ---------------------------------------------------------*/
@@ -136,7 +137,16 @@ void PWR_ExitStopMode(void)
   /* USER CODE BEGIN ExitStopMode_2 */
 #endif
   __HAL_RCC_I2C1_CLK_ENABLE();
-  HAL_I2C_Init(&hi2c1);
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    /* I2C did not come back. Do NOT run the heavy bus-recovery (~20ms of SCL
+     * toggling + re-init) or a reset here: this hook can execute microseconds
+     * before a time-critical LoRaWAN RX window, and blocking it would make the
+     * node miss the downlink (ADR commands, 0xCC/0xDD config). Just flag the
+     * failure — BMM350_Read_Safe() already escalates to bus recovery and, if
+     * that fails, a system reset, from the non-time-critical sensor-read path. */
+    bmm350_i2c_fail_count++;
+  }
   /* USER CODE END ExitStopMode_2 */
 }
 

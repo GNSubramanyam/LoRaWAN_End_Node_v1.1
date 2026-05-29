@@ -117,19 +117,39 @@ void HAL_ADC_MspDeInit(ADC_HandleTypeDef* adcHandle)
 }
 
 /* USER CODE BEGIN 1 */
+/* Full-scale reference for the battery measurement on ADC_IN4 (PB2), in volts.
+ * This is (VREF+ at the ADC) * (battery divider ratio). VERIFY against the
+ * board schematic — the previous 1.8 was unconfirmed and may be wrong if
+ * VDDA/VREF+ is 3.3 V or if the divider ratio differs. This only sets the
+ * scale/threshold accuracy; it does not affect the read-reliability fix below. */
+#define ADC_BATT_FULLSCALE_V   1.8f
+
 /**
   * @brief  Read battery voltage on-demand from ADC_IN4 (PB2).
-  *         Calibrates the ADC, performs a single conversion, and returns
-  *         the result as a voltage (float, in volts).
-  * @retval Battery voltage in volts (0.0 – VDDA).
+  *         Self-contained: (re)initialises and configures the ADC every call,
+  *         then tears it down again. This is required because the LoRaWAN stack
+  *         callbacks (SYS_GetBatteryLevel / SYS_GetTemperatureLevel ->
+  *         ADC_ReadChannels) HAL_ADC_DeInit() the shared ADC when they finish.
+  *         Without re-init, this read used to run on a dead ADC, return 0.0 V,
+  *         and trip a false battery-low alert. We now own the full setup/teardown.
+  * @retval Battery voltage in volts, or 0.0 only on a genuine conversion failure.
   */
 float ADC_ReadBatteryVoltage(void)
 {
   float voltage = 0.0f;
   uint32_t rawValue = 0;
 
+  /* Bring the ADC up and configure ADC_CHANNEL_4 (PB2). MX_ADC_Init() both
+   * initialises the peripheral and selects channel 4, regardless of whatever
+   * state the stack left the ADC in. */
+  MX_ADC_Init();
+
   /* Calibrate ADC for better accuracy */
-  HAL_ADCEx_Calibration_Start(&hadc);
+  if (HAL_ADCEx_Calibration_Start(&hadc) != HAL_OK)
+  {
+    HAL_ADC_DeInit(&hadc);
+    return 0.0f;
+  }
 
   /* Start conversion */
   if (HAL_ADC_Start(&hadc) == HAL_OK)
@@ -138,11 +158,15 @@ float ADC_ReadBatteryVoltage(void)
     if (HAL_ADC_PollForConversion(&hadc, 100) == HAL_OK)
     {
       rawValue = HAL_ADC_GetValue(&hadc);
-      /* Convert 12-bit ADC value to voltage (VDDA = 3.3 V) */
-      voltage = ((float)rawValue * 1.8f) / 4095.0f;
+      /* Convert 12-bit ADC value to voltage. */
+      voltage = ((float)rawValue * ADC_BATT_FULLSCALE_V) / 4095.0f;
     }
     HAL_ADC_Stop(&hadc);
   }
+
+  /* Leave the ADC powered down, matching the state the stack's own ADC users
+   * expect between calls. */
+  HAL_ADC_DeInit(&hadc);
 
   return voltage;
 }

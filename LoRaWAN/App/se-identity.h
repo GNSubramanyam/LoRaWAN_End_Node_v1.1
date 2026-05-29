@@ -104,11 +104,16 @@ extern "C" {
 
 /*!
  * Application root key
+ *
+ * NOTE: This is the published NIST AES test vector and is INSECURE on its own.
+ *       At runtime, LoRa_InstallPerDeviceKeys() in lora_keys.c overrides this
+ *       with a key derived from the MCU UID + PROJECT_SECRET, so what actually
+ *       ships over the air is per-device.
  */
 #define LORAWAN_APP_KEY                                    2B,7E,15,16,28,AE,D2,A6,AB,F7,15,88,09,CF,4F,3C
 
 /*!
- * Network root key
+ * Network root key — see note above; overridden by LoRa_InstallPerDeviceKeys().
  */
 #define LORAWAN_NWK_KEY                                    2B,7E,15,16,28,AE,D2,A6,AB,F7,15,88,09,CF,4F,3C
 

@@ -178,6 +178,8 @@ uint16_t SYS_GetBatteryLevel(void)
 
 /* USER CODE END PrFD */
 
+#define ADC_READ_TIMEOUT_MS  200U
+
 static uint32_t ADC_ReadChannels(uint32_t channel)
 {
   /* USER CODE BEGIN ADC_ReadChannels_1 */
@@ -188,34 +190,35 @@ static uint32_t ADC_ReadChannels(uint32_t channel)
 
   MX_ADC_Init();
 
-  /* Start Calibration */
+  /* Non-critical readings: on any HAL failure, return 0 instead of trapping
+   * the device in Error_Handler() for ~32s until IWDG resets it. */
   if (HAL_ADCEx_Calibration_Start(&hadc) != HAL_OK)
   {
-    Error_Handler();
+    HAL_ADC_DeInit(&hadc);
+    return 0;
   }
 
-  /* Configure Regular Channel */
   sConfig.Channel = channel;
   sConfig.Rank = ADC_REGULAR_RANK_1;
   sConfig.SamplingTime = ADC_SAMPLINGTIME_COMMON_1;
   if (HAL_ADC_ConfigChannel(&hadc, &sConfig) != HAL_OK)
   {
-    Error_Handler();
+    HAL_ADC_DeInit(&hadc);
+    return 0;
   }
 
   if (HAL_ADC_Start(&hadc) != HAL_OK)
   {
-    /* Start Error */
-    Error_Handler();
+    HAL_ADC_DeInit(&hadc);
+    return 0;
   }
-  /** Wait for end of conversion */
-  HAL_ADC_PollForConversion(&hadc, HAL_MAX_DELAY);
 
-  /** Wait for end of conversion */
-  HAL_ADC_Stop(&hadc);   /* it calls also ADC_Disable() */
+  if (HAL_ADC_PollForConversion(&hadc, ADC_READ_TIMEOUT_MS) == HAL_OK)
+  {
+    ADCxConvertedValues = HAL_ADC_GetValue(&hadc);
+  }
 
-  ADCxConvertedValues = HAL_ADC_GetValue(&hadc);
-
+  HAL_ADC_Stop(&hadc);
   HAL_ADC_DeInit(&hadc);
 
   return ADCxConvertedValues;

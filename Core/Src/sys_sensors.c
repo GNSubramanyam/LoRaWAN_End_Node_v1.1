@@ -296,49 +296,38 @@ int BMM350_Init(void)
 {
 	HAL_GPIO_WritePin(MAGNETIC_PWR_GPIO_Port, MAGNETIC_PWR_Pin, GPIO_PIN_SET);
 	HAL_Delay(1);
-	uint8_t chip_id;
-	uint8_t int_ctrl, err_reg_data = 0;
-	uint8_t set_int_ctrl;
+	uint8_t err_reg_data = 0;
 	struct bmm350_pmu_cmd_status_0 pmu_cmd_stat_0;
 
 	rslt = bmm350_interface_init(&dev);
+	if (rslt != BMM350_OK) return 1;
 
 	rslt = bmm350_init(&dev);
-	chip_id = dev.chip_id;
-	if (chip_id == 0x33)
+	if (rslt != BMM350_OK || dev.chip_id != 0x33)
 	{
-		  /* Check PMU busy */
-		  rslt = bmm350_get_pmu_cmd_status_0(&pmu_cmd_stat_0, &dev);
-
-		  /* Get error data */
-		  rslt = bmm350_get_regs(BMM350_REG_ERR_REG, &err_reg_data, 1, &dev);
-
-		  /* Configure interrupt settings */
-		  rslt = bmm350_configure_interrupt(BMM350_PULSED,
-		                                    BMM350_ACTIVE_HIGH,
-		                                    BMM350_INTR_PUSH_PULL,
-		                                    BMM350_UNMAP_FROM_PIN,
-		                                    &dev);
-
-		  /* Enable data ready interrupt */
-		  rslt = bmm350_enable_interrupt(BMM350_ENABLE_INTERRUPT, &dev);
-
-		  /* Get interrupt settings */
-		  rslt = bmm350_get_regs(BMM350_REG_INT_CTRL, &int_ctrl, 1, &dev);
-
-		  set_int_ctrl = ((BMM350_INT_POL_ACTIVE_HIGH << 1) | (BMM350_INT_OD_PUSHPULL << 2) | BMM350_ENABLE << 7);
-
-		  /* Set ODR and performance */
-		  rslt = bmm350_set_odr_performance(BMM350_DATA_RATE_100HZ, BMM350_LOWPOWER, &dev);
-
-		  /* Enable all axis */
-		  rslt = bmm350_enable_axes(BMM350_X_EN, BMM350_Y_EN, BMM350_Z_EN, &dev);
-
-		  rslt = bmm350_set_powermode(BMM350_SUSPEND_MODE, &dev);
-
-		  return 0;
+		/* Sensor not detected / not communicating — report failure so the
+		 * caller (e.g. BMM350_Read_Safe recovery) knows init did not succeed. */
+		return 1;
 	}
-	return 1;
+
+	/* Read status + error registers (diagnostics only; non-fatal). */
+	(void)bmm350_get_pmu_cmd_status_0(&pmu_cmd_stat_0, &dev);
+	(void)bmm350_get_regs(BMM350_REG_ERR_REG, &err_reg_data, 1, &dev);
+
+	/* Configure data-ready interrupt (pulsed, active-high, push-pull). */
+	rslt = bmm350_configure_interrupt(BMM350_PULSED,
+	                                  BMM350_ACTIVE_HIGH,
+	                                  BMM350_INTR_PUSH_PULL,
+	                                  BMM350_UNMAP_FROM_PIN,
+	                                  &dev);
+	if (rslt == BMM350_OK) rslt = bmm350_enable_interrupt(BMM350_ENABLE_INTERRUPT, &dev);
+
+	/* ODR / averaging, enable axes, then park in suspend (app uses forced-mode reads). */
+	if (rslt == BMM350_OK) rslt = bmm350_set_odr_performance(BMM350_DATA_RATE_100HZ, BMM350_LOWPOWER, &dev);
+	if (rslt == BMM350_OK) rslt = bmm350_enable_axes(BMM350_X_EN, BMM350_Y_EN, BMM350_Z_EN, &dev);
+	if (rslt == BMM350_OK) rslt = bmm350_set_powermode(BMM350_SUSPEND_MODE, &dev);
+
+	return (rslt == BMM350_OK) ? 0 : 1;
 }
 
 
@@ -346,35 +335,32 @@ int BMM350_Read(BMM350_data_t *s_data)
 {
     int_status = 0;
 
-    /* Get data ready interrupt status */
-    //rslt = bmm350_get_regs(BMM350_REG_INT_STATUS, &int_status, 1, &dev);
-
     sx = 0;
     sy = 0;
     sz = 0;
     st = 0;
 
-    /* Check if data ready interrupt occurred */
-  //  if (int_status & BMM350_DRDY_DATA_REG_MSK)
-  //  {
+    /* If any I2C transaction inside the loop fails, the underlying driver
+     * now returns BMM350_E_COM_FAIL. Bubble that up so callers can react. */
+    for (int i = 0; i < T_AVG; i++)
+    {
+        rslt = bmm350_set_powermode(BMM350_FORCED_MODE, &dev);
+        if (rslt != BMM350_OK) return -1;
 
-  	  for (int i = 0; i < T_AVG; i++)
-  	  {
-  		  	rslt = bmm350_set_powermode(BMM350_FORCED_MODE, &dev);
-            rslt = bmm350_get_compensated_mag_xyz_temp_data(&mag_temp_data, &dev);
-            sx += mag_temp_data.x;
-            sy += mag_temp_data.y;
-            sz += mag_temp_data.z;
-            st += mag_temp_data.temperature;
-  	      //HAL_Delay(1);
-  	  }
+        rslt = bmm350_get_compensated_mag_xyz_temp_data(&mag_temp_data, &dev);
+        if (rslt != BMM350_OK) return -1;
 
-  	  s_data->x = sx/T_AVG;
-  	  s_data->y = sy/T_AVG;
-  	  s_data->z = sz/T_AVG;
-  	  s_data->temperature = st/T_AVG;
+        sx += mag_temp_data.x;
+        sy += mag_temp_data.y;
+        sz += mag_temp_data.z;
+        st += mag_temp_data.temperature;
+    }
 
-    //}
+    s_data->x = sx/T_AVG;
+    s_data->y = sy/T_AVG;
+    s_data->z = sz/T_AVG;
+    s_data->temperature = st/T_AVG;
+
     return 0;
 }
 /* USER CODE END EF */

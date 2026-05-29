@@ -967,8 +967,8 @@ LoRaMacStatus_t RegionIN865NextChannel( NextChanParams_t* nextChanParams, uint8_
     }
     else if( status == LORAMAC_STATUS_NO_CHANNEL_FOUND )
     {
-        // Datarate not supported by any channel, restore defaults
-        RegionNvmGroup2->ChannelsMask[0] |= LC( 1 ) + LC( 2 ) + LC( 3 );
+        // Datarate not supported by any channel, restore defaults — all 8.
+        RegionNvmGroup2->ChannelsMask[0] |= LC( 1 ) + LC( 2 ) + LC( 3 ) + LC( 4 ) + LC( 5 ) + LC( 6 ) + LC( 7 ) + LC( 8 );
     }
     return status;
 #else
