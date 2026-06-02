@@ -1,0 +1,1 @@
+- [Build procedure](build-procedure.md) — compile the STM32WL firmware from CLI using the STM32CubeIDE-bundled arm-none-eabi-gcc

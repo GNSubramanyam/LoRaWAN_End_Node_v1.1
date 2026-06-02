@@ -67,7 +67,7 @@ extern "C"
 /*!
  * Number of channels to apply for the CF list
  */
-#define EU868_NUMB_CHANNELS_CF_LIST                 0//5
+#define EU868_NUMB_CHANNELS_CF_LIST                 5 //0
 
 /*!
  * Minimal datarate that can be used by the node
@@ -268,7 +268,7 @@ extern "C"
 /*!
  * LoRaMac channels which are allowed for the join procedure
  */
-#define EU868_JOIN_CHANNELS                         ( uint16_t )( LC( 1 )/* | LC( 2 ) | LC( 3 ) */)
+#define EU868_JOIN_CHANNELS                         ( uint16_t )( LC( 1 ) | LC( 2 ) | LC( 3 ) )
 
 /*!
  * Data rates table definition

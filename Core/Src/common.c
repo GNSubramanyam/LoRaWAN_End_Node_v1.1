@@ -13,19 +13,20 @@ BMM350_INTF_RET_TYPE bmm350_i2c_read(uint8_t reg_addr, uint8_t *reg_data, uint32
 
 	status = HAL_I2C_Master_Transmit(&hi2c1, BMM350_ADDRESS, &reg_addr, 1, 100);
 	if (status != HAL_OK) {
-		//printf("BMM350 I2C read fail\n");
+		/* Surface the bus error so the BMM350 driver can fail the read
+		   instead of operating on stale/garbage data. */
+		return BMM350_E_COM_FAIL;
 	}
-	//uint32_t err = HAL_I2C_GetError(&hi2c1);
 
 	status = HAL_I2C_Master_Receive(&hi2c1, BMM350_ADDRESS | 0x01, reg_data, length, 100);
 	if (status != HAL_OK) {
-		//printf("BMM350 I2C read fail\n");
+		return BMM350_E_COM_FAIL;
 	}
 	return BMM350_OK;
 
 }
 
-BMM350_INTF_RET_TYPE bmm350_i2c_write(uint8_t reg_addr, uint8_t *reg_data, uint32_t length, void *intf_ptr)
+BMM350_INTF_RET_TYPE bmm350_i2c_write(uint8_t reg_addr, const uint8_t *reg_data, uint32_t length, void *intf_ptr)
 {
 	(void)intf_ptr;
     uint8_t tx_buf[length + 1];
@@ -40,7 +41,7 @@ BMM350_INTF_RET_TYPE bmm350_i2c_write(uint8_t reg_addr, uint8_t *reg_data, uint3
     }
 	status = HAL_I2C_Master_Transmit(&hi2c1, BMM350_ADDRESS, tx_buf, length + 1, 100);
 	if (status != HAL_OK) {
-		//printf("BMM350 I2C write fail\n");
+		return BMM350_E_COM_FAIL;
 	}
 	return BMM350_OK;
 
@@ -49,7 +50,13 @@ BMM350_INTF_RET_TYPE bmm350_i2c_write(uint8_t reg_addr, uint8_t *reg_data, uint3
 void bmm350_delay(uint32_t period, void *intf_ptr)
 {
 	(void)intf_ptr;
-	uint32_t delay_ms = period / 1000;
+	/* The BMM350 driver requests delays in microseconds, many of them
+	   sub-millisecond (e.g. 300 us settling). HAL_Delay() has 1 ms
+	   granularity, so round UP to the next whole millisecond to guarantee
+	   the sensor's minimum settling time is always met. Truncating with
+	   (period / 1000) would turn these into HAL_Delay(0) and risk corrupt
+	   forced-mode / magnetic-reset readings. */
+	uint32_t delay_ms = (period + 999u) / 1000u;
 	HAL_Delay(delay_ms);
 }
 

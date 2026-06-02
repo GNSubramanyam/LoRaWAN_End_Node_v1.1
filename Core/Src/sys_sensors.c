@@ -346,27 +346,27 @@ int BMM350_Read(BMM350_data_t *s_data)
 {
     int_status = 0;
 
-    /* Get data ready interrupt status */
-    //rslt = bmm350_get_regs(BMM350_REG_INT_STATUS, &int_status, 1, &dev);
-
     sx = 0;
     sy = 0;
     sz = 0;
     st = 0;
 
-    /* Check if data ready interrupt occurred */
-  //  if (int_status & BMM350_DRDY_DATA_REG_MSK)
-  //  {
-
   	  for (int i = 0; i < T_AVG; i++)
   	  {
   		  	rslt = bmm350_set_powermode(BMM350_FORCED_MODE, &dev);
+  		  	if (rslt != BMM350_OK)
+  		  	{
+  		  		return -1;  /* I2C/sensor fault — caller must not act on this read */
+  		  	}
             rslt = bmm350_get_compensated_mag_xyz_temp_data(&mag_temp_data, &dev);
+            if (rslt != BMM350_OK)
+            {
+                return -1;
+            }
             sx += mag_temp_data.x;
             sy += mag_temp_data.y;
             sz += mag_temp_data.z;
             st += mag_temp_data.temperature;
-  	      //HAL_Delay(1);
   	  }
 
   	  s_data->x = sx/T_AVG;
@@ -374,7 +374,6 @@ int BMM350_Read(BMM350_data_t *s_data)
   	  s_data->z = sz/T_AVG;
   	  s_data->temperature = st/T_AVG;
 
-    //}
     return 0;
 }
 /* USER CODE END EF */

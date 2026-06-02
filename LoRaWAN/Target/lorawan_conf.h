@@ -94,9 +94,9 @@ extern "C" {
 /*#define REGION_CN470*/
 /*#define REGION_CN779*/
 /*#define REGION_EU433*/
-//#define REGION_EU868
+#define REGION_EU868
 /*#define REGION_KR920*/
-#define REGION_IN865
+//#define REGION_IN865
 /*#define REGION_US915*/
 /*#define REGION_RU864*/
 

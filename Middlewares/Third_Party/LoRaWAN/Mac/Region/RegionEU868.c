@@ -388,7 +388,7 @@ void RegionEU868InitDefaults( InitDefaultsParams_t* params )
             RegionNvmGroup2->Channels[2] = ( ChannelParams_t ) EU868_LC3;
 
             // Default ChannelsMask
-            RegionNvmGroup2->ChannelsDefaultMask[0] = LC( 1 ) /*+ LC( 2 ) + LC( 3 )*/;
+            RegionNvmGroup2->ChannelsDefaultMask[0] = LC( 1 ) + LC( 2 ) + LC( 3 );
 
             // Update the channels mask
             RegionCommonChanMaskCopy( RegionNvmGroup2->ChannelsMask, RegionNvmGroup2->ChannelsDefaultMask, CHANNELS_MASK_SIZE );
@@ -921,7 +921,7 @@ LoRaMacStatus_t RegionEU868NextChannel( NextChanParams_t* nextChanParams, uint8_
 
     if( RegionCommonCountChannels( RegionNvmGroup2->ChannelsMask, 0, 1 ) == 0 )
     { // Reactivate default channels
-        RegionNvmGroup2->ChannelsMask[0] |= LC( 1 ) /*+ LC( 2 ) + LC( 3 )*/;
+        RegionNvmGroup2->ChannelsMask[0] |= LC( 1 ) + LC( 2 ) + LC( 3 );
     }
 
     // Search how many channels are enabled
@@ -959,7 +959,7 @@ LoRaMacStatus_t RegionEU868NextChannel( NextChanParams_t* nextChanParams, uint8_
     else if( status == LORAMAC_STATUS_NO_CHANNEL_FOUND )
     {
         // Datarate not supported by any channel, restore defaults
-        RegionNvmGroup2->ChannelsMask[0] |= LC( 1 ) /*+ LC( 2 ) + LC( 3 )*/;
+        RegionNvmGroup2->ChannelsMask[0] |= LC( 1 ) + LC( 2 ) + LC( 3 );
     }
     return status;
 #else

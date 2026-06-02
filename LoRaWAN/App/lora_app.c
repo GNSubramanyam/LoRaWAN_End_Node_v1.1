@@ -40,6 +40,7 @@
 #include "adc.h"             /* For ADC_ReadVoltage, adc_voltage */
 #include "utilities.h"		/* For randr for jitter */
 #include "iwdg.h"
+#include <stddef.h>
 /* USER CODE END Includes */
 
 /* External variables ---------------------------------------------------------*/
@@ -68,6 +69,15 @@ typedef enum TxEventType_e
 
 /* USER CODE BEGIN PTD */
 
+#define CALIB_NVM_MAGIC  0xCA1BDA7AUL  /* "CALIBRATA" — validity marker */
+typedef struct __attribute__((packed, aligned(8)))
+{
+  uint32_t       magic;            /* Must equal CALIB_NVM_MAGIC to be valid */
+  BMM350_data_t  base;             /* Calibrated baseline (x, y, z, temperature) = 16 bytes */
+  uint8_t        calibration_done; /* 1 = calibrated, 0 = not */
+  uint8_t        _pad[3];          /* Pad to 8-byte alignment for flash write */
+  uint32_t       crc;              /* Simple CRC32 over [magic … _pad] for integrity */
+} CalibNvm_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -91,30 +101,34 @@ typedef enum TxEventType_e
 #define LORAWAN_NVM_BASE_ADDRESS                    ((void *)0x0803F000UL)
 
 /* USER CODE BEGIN PD */
+#define CALIB_NVM_BASE_ADDRESS  ((void *)0x0803F800UL)
 //static const char *slotStrings[] = { "1", "2", "C", "C_MC", "P", "P_MC" };
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-#define SEND_HB_MIN					5 //90
-#define APP_HB_DUTYCYCLE			SEND_HB_MIN * 60000
+#define SEND_HB_MIN					30  /* heartbeat period in minutes */
+#define APP_HB_DUTYCYCLE			(SEND_HB_MIN * 60000)
 #define APP_WDG_DUTYCYCLE			15000
 #define CHECK_TIME					12 * 60 * 60000
-#define CALIBRATION_SAMPLES			1 //5
+#define CALIBRATION_SAMPLES			5
 #define OCC_CONFIRM_READS			2   /* Extra confirmation reads for occupied (total 3 with initial) */
 #define UNOCC_CONFIRM_READS			1   /* Extra confirmation reads for empty (total 2 with initial) */
 #define CONFIRM_PERIOD_MS			10000 /* ms between confirmation reads — MCU sleeps (STOP2) between */
 #define SLOT_EMPTY					(uint8_t)(0x00)
 #define SLOT_OCCUPIED				(uint8_t)(0x01)
 #define THRESHOLD_STEP_SIZE			0.5f
+#define THRESHOLD_MIN				1.0f   /* Reject downlinks that would disable detection (e.g. 0) */
+#define THRESHOLD_MAX				100.0f /* Reject implausibly high thresholds */
 #define BATTERY_LOW_THRESHOLD		1.4f   /* Volts — send alert when battery drops below this */
 #define BATTERY_LOW_STATUS			(uint8_t)(0x09)
 #define TEMPERATURE_HIGH_THRESHOLD	60.0f   /* degC — send alert when temperature exceeds this */
 #define TEMPERATURE_HIGH_STATUS		(uint8_t)(0x0A)
 #define RETRANSMIT_DELAY_MS			15000
 #define JITTER_MS					20000		/* jitter in milliseconds */
+#define HB_JITTER_MS				(5 * 60 * 1000)
 #define JITTER_RETRANSMISSION		2000		/* jitter for retransmission */
-#define THREE_HOUR_TIME				3 * 60 * 60000
+#define THREE_HOUR_TIME				(3 * 60 * 60000)
 #define MAX_JOIN_ATTEMPTS			30
 
 typedef enum {
@@ -258,6 +272,10 @@ static void DoRetransmit(void);
 static void join_task(void);
 static void WDG_Timer_task(void);
 static void OnWDGTimerEvent(void *context);
+static void CalibNvm_Store(void);
+static bool CalibNvm_Restore(void);
+static uint32_t CalibNvm_ComputeCRC(const CalibNvm_t *nvm);
+
 /* USER CODE END PFP */
 
 /* Private variables ---------------------------------------------------------*/
@@ -387,6 +405,12 @@ void LoRaWAN_Init(void)
 	{
 		Error_Handler();
 	}
+	/* Restore calibration data from NVM if valid */
+	if (CalibNvm_Restore())
+	{
+	  APP_LOG(TS_ON, VLEVEL_L, "Calibration restored from NVM — skipping recalibration\r\n");
+	}
+
   /* USER CODE END LoRaWAN_Init_1 */
 
   UTIL_TIMER_Create(&StopJoinTimer, JOIN_TIME, UTIL_TIMER_ONESHOT, OnStopJoinTimerEvent, NULL);
@@ -452,6 +476,7 @@ void LoRaWAN_Init(void)
     else
     {
 	    UTIL_TIMER_Start(&TxTimer);
+	    UTIL_TIMER_Start(&SendHeartBeatTimer);
 	    UTIL_TIMER_Start(&BatteryCheckTimer);
 	    UTIL_TIMER_Start(&TemperatureCheckTimer);
     }
@@ -518,7 +543,14 @@ static void ConfirmDetection(void)
   UTIL_TIMER_Time_t nextTxIn = 0;
 
   BMM350_data_t reading;
-  BMM350_Read(&reading);
+  if (BMM350_Read(&reading) != 0)
+  {
+    /* Sensor/I2C fault during confirmation — abort this attempt without
+       changing the parked state. The next TxTimer scan re-evaluates. */
+    detect_state = DETECT_IDLE;
+    APP_LOG(TS_ON, VLEVEL_L, "BMM350 read failed during confirm — aborting\r\n");
+    return;
+  }
   float mag = ComputeMagnitude(&reading);
 
   if (detect_state == DETECT_CONFIRMING_OCC)
@@ -534,6 +566,14 @@ static void ConfirmDetection(void)
         APP_LOG(TS_ON, VLEVEL_L, "VEHICLE DETECTED (%d/%d confirmed)\r\n",
                 OCC_CONFIRM_READS + 1, OCC_CONFIRM_READS + 1);
 
+        /* Arm a retransmit unconditionally so the state change reaches the
+           server even when the MAC is busy or duty-cycle restricted at this
+           instant. DoRetransmit() re-sends once the stack is free. */
+        retransmit_status = SLOT_OCCUPIED;
+        retransmit_pending = true;
+        UTIL_TIMER_Stop(&RetransmitTimer);
+        UTIL_TIMER_Start(&RetransmitTimer);
+
         if (LmHandlerIsBusy() == false)
         {
           uint32_t k = 0;
@@ -541,27 +581,13 @@ static void ConfirmDetection(void)
           AppData.Buffer[k++] = SLOT_OCCUPIED;
           AppData.BufferSize = k;
           status = LmHandlerSend(&AppData, LmHandlerParams.IsTxConfirmed, false);
-          if (LORAMAC_HANDLER_SUCCESS == status)
-          {
-            retransmit_status = SLOT_OCCUPIED;
-            retransmit_pending = true;
-            UTIL_TIMER_Stop(&RetransmitTimer);
-            UTIL_TIMER_Start(&RetransmitTimer);
-          }
-          else if (LORAMAC_HANDLER_DUTYCYCLE_RESTRICTED == status)
+          if (LORAMAC_HANDLER_DUTYCYCLE_RESTRICTED == status)
           {
             nextTxIn = LmHandlerGetDutyCycleWaitTime();
             if (nextTxIn > 0)
             {
               APP_LOG(TS_ON, VLEVEL_L, "Next Tx in  : ~%d second(s)\r\n", (nextTxIn / 1000));
             }
-          }
-          else
-          {
-              retransmit_status = SLOT_OCCUPIED;
-              retransmit_pending = true;
-        	  UTIL_TIMER_Stop(&RetransmitTimer);
-        	  UTIL_TIMER_Start(&RetransmitTimer);
           }
         }
       }
@@ -591,6 +617,14 @@ static void ConfirmDetection(void)
         APP_LOG(TS_ON, VLEVEL_L, "VEHICLE LEFT (%d/%d confirmed)\r\n",
                 UNOCC_CONFIRM_READS + 1, UNOCC_CONFIRM_READS + 1);
 
+        /* Arm a retransmit unconditionally so the state change reaches the
+           server even when the MAC is busy or duty-cycle restricted at this
+           instant. DoRetransmit() re-sends once the stack is free. */
+        retransmit_status = SLOT_EMPTY;
+        retransmit_pending = true;
+        UTIL_TIMER_Stop(&RetransmitTimer);
+        UTIL_TIMER_Start(&RetransmitTimer);
+
         if (LmHandlerIsBusy() == false)
         {
           uint32_t k = 0;
@@ -598,27 +632,13 @@ static void ConfirmDetection(void)
           AppData.Buffer[k++] = SLOT_EMPTY;
           AppData.BufferSize = k;
           status = LmHandlerSend(&AppData, LmHandlerParams.IsTxConfirmed, false);
-          if (LORAMAC_HANDLER_SUCCESS == status)
-          {
-              retransmit_status = SLOT_EMPTY;
-              retransmit_pending = true;
-        	  UTIL_TIMER_Stop(&RetransmitTimer);
-        	  UTIL_TIMER_Start(&RetransmitTimer);
-          }
-          else if (LORAMAC_HANDLER_DUTYCYCLE_RESTRICTED == status)
+          if (LORAMAC_HANDLER_DUTYCYCLE_RESTRICTED == status)
           {
             nextTxIn = LmHandlerGetDutyCycleWaitTime();
             if (nextTxIn > 0)
             {
               APP_LOG(TS_ON, VLEVEL_L, "Next Tx in  : ~%d second(s)\r\n", (nextTxIn / 1000));
             }
-          }
-          else
-          {
-              retransmit_status = SLOT_EMPTY;
-              retransmit_pending = true;
-        	  UTIL_TIMER_Stop(&RetransmitTimer);
-        	  UTIL_TIMER_Start(&RetransmitTimer);
           }
         }
 
@@ -746,7 +766,13 @@ static void CheckTemperature(void)
   UTIL_TIMER_Time_t nextTxIn = 0;
 
   BMM350_data_t reading;
-  BMM350_Read(&reading);
+  if (BMM350_Read(&reading) != 0)
+  {
+    /* Sensor/I2C fault — skip this temperature check rather than alert on
+       invalid data. */
+    APP_LOG(TS_ON, VLEVEL_L, "BMM350 read failed — skipping temperature check\r\n");
+    return;
+  }
   float temperature = reading.temperature;
   APP_LOG(TS_ON, VLEVEL_L, "BMM350 Temperature: %d.%02d degC\r\n",
           (int)temperature,
@@ -831,6 +857,7 @@ static void join_task(void)
 		isJoined = true;
 		join_attempts = 0;
 	    UTIL_TIMER_Start(&TxTimer);
+	    UTIL_TIMER_Start(&SendHeartBeatTimer);
 	    UTIL_TIMER_Start(&BatteryCheckTimer);
 	    UTIL_TIMER_Start(&TemperatureCheckTimer);
 		return;
@@ -856,6 +883,55 @@ static void join_task(void)
 static void WDG_Timer_task(void)
 {
 	HAL_IWDG_Refresh(&hiwdg);
+}
+
+static void CalibNvm_Store(void)
+{
+  CalibNvm_t nvm;
+  nvm.magic            = CALIB_NVM_MAGIC;
+  nvm.base             = BMM350_CALIBRATED_BASE;
+  nvm.calibration_done = is_Calibration_done ? 1 : 0;
+  memset(nvm._pad, 0, sizeof(nvm._pad));
+  nvm.crc              = CalibNvm_ComputeCRC(&nvm);
+
+  if (FLASH_IF_Erase(CALIB_NVM_BASE_ADDRESS, FLASH_PAGE_SIZE) == FLASH_IF_OK)
+  {
+    FLASH_IF_Write(CALIB_NVM_BASE_ADDRESS, (const void *)&nvm, sizeof(CalibNvm_t));
+    APP_LOG(TS_ON, VLEVEL_L, "CALIB NVM STORED\r\n");
+  }
+}
+
+static bool CalibNvm_Restore(void)
+{
+  CalibNvm_t nvm;
+  FLASH_IF_Read(&nvm, CALIB_NVM_BASE_ADDRESS, sizeof(CalibNvm_t));
+
+  if (nvm.magic != CALIB_NVM_MAGIC)
+    return false;
+
+  if (nvm.crc != CalibNvm_ComputeCRC(&nvm))
+    return false;
+
+  BMM350_CALIBRATED_BASE = nvm.base;
+  is_Calibration_done    = (nvm.calibration_done == 1);
+
+  APP_LOG(TS_ON, VLEVEL_L, "CALIB NVM RESTORED (parked=%d)\r\n", parked);
+  return true;
+}
+
+static uint32_t CalibNvm_ComputeCRC(const CalibNvm_t *nvm)
+{
+  /* CRC over everything except the crc field itself */
+  const uint8_t *data = (const uint8_t *)nvm;
+  uint32_t len = offsetof(CalibNvm_t, crc);
+  uint32_t crc = 0xFFFFFFFF;
+  for (uint32_t i = 0; i < len; i++)
+  {
+    crc ^= data[i];
+    for (int j = 0; j < 8; j++)
+      crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+  }
+  return ~crc;
 }
 /* USER CODE END PrFD */
 
@@ -911,7 +987,13 @@ static void OnRxData(LmHandlerAppData_t *appData, LmHandlerRxParams_t *params)
 	              {
 	            	  if (appData->Buffer[0] == 0xDD)
 	            	  {
-	            		  THRESHOLD = appData->Buffer[1] * THRESHOLD_STEP_SIZE;
+	            		  float new_threshold = appData->Buffer[1] * THRESHOLD_STEP_SIZE;
+	            		  /* Ignore out-of-range values so a bad/garbled downlink
+	            		     cannot disable detection (threshold 0) or stall it. */
+	            		  if (new_threshold >= THRESHOLD_MIN && new_threshold <= THRESHOLD_MAX)
+	            		  {
+	            			  THRESHOLD = new_threshold;
+	            		  }
 	            	  }
 	              }
 	              break;
@@ -931,7 +1013,7 @@ static void SendTxData(void)
 {
   /* USER CODE BEGIN SendTxData_1 */
   LmHandlerErrorStatus_t status = LORAMAC_HANDLER_ERROR;
-  UTIL_TIMER_Time_t nextTxIn = 0;
+  //UTIL_TIMER_Time_t nextTxIn = 0;
 
   if (LmHandlerIsBusy() == false)
   {
@@ -943,7 +1025,13 @@ static void SendTxData(void)
 
     /* --- Read BMM350 once --- */
     BMM350_data_t reading;
-    BMM350_Read(&reading);
+    if (BMM350_Read(&reading) != 0)
+    {
+      /* Sensor/I2C fault — skip this scan rather than calibrate or detect
+         on invalid data. Next TxTimer cycle will retry. */
+      APP_LOG(TS_ON, VLEVEL_L, "BMM350 read failed — skipping scan\r\n");
+      return;
+    }
 
     if (!is_Calibration_done)
     {
@@ -973,6 +1061,8 @@ static void SendTxData(void)
 
         is_Calibration_done = true;
         calibration_index = 0;
+        // Store calibrated data
+        CalibNvm_Store();
 
         /* Send calibration-done uplink */
         if (LmHandlerIsBusy() == false)
@@ -987,8 +1077,8 @@ static void SendTxData(void)
             APP_LOG(TS_ON, VLEVEL_L, "CALIBRATION DONE\r\n");
           }
         }
-        UTIL_TIMER_Stop(&SendHeartBeatTimer);
-        UTIL_TIMER_Start(&SendHeartBeatTimer);
+        //UTIL_TIMER_Stop(&SendHeartBeatTimer);
+        //UTIL_TIMER_Start(&SendHeartBeatTimer);
       }
     }
     else
@@ -1057,7 +1147,7 @@ static void OnHeartBeatTimerEvent(void *context)
   /* USER CODE BEGIN OnReadBMM350TimerEvent */
 	/*Wait for next tx slot*/
 	UTIL_TIMER_Stop(&SendHeartBeatTimer);
-	UTIL_TIMER_SetPeriod(&SendHeartBeatTimer, HBPeriodicity + randr(-JITTER_MS, JITTER_MS));
+	UTIL_TIMER_SetPeriod(&SendHeartBeatTimer, HBPeriodicity + randr(-HB_JITTER_MS, HB_JITTER_MS));
 	UTIL_TIMER_Start(&SendHeartBeatTimer);
   /* USER CODE END OnReadBMM350TimerEvent */
 }
@@ -1067,7 +1157,7 @@ static void OnBatteryCheckTimerEvent(void *context)
   UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_BatteryCheckEvent), CFG_SEQ_Prio_0);
   /* Restart timer for next check */
   UTIL_TIMER_Stop(&BatteryCheckTimer);
-  UTIL_TIMER_SetPeriod(&BatteryCheckTimer, CHECK_TIME + randr(-JITTER_MS, JITTER_MS));
+  UTIL_TIMER_SetPeriod(&BatteryCheckTimer, CHECK_TIME + randr(-HB_JITTER_MS, HB_JITTER_MS));
   UTIL_TIMER_Start(&BatteryCheckTimer);
 }
 
@@ -1076,7 +1166,7 @@ static void OnTemperatureCheckTimerEvent(void *context)
   UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_TemperatureCheckEvent), CFG_SEQ_Prio_0);
   /* Restart timer for next check */
   UTIL_TIMER_Stop(&TemperatureCheckTimer);
-  UTIL_TIMER_SetPeriod(&TemperatureCheckTimer, CHECK_TIME + randr(-JITTER_MS, JITTER_MS));
+  UTIL_TIMER_SetPeriod(&TemperatureCheckTimer, CHECK_TIME + randr(-HB_JITTER_MS, HB_JITTER_MS));
   UTIL_TIMER_Start(&TemperatureCheckTimer);
 }
 
